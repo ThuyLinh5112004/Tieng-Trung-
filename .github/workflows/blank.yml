@@ -1,0 +1,364 @@
+# This is a basic workflow to help you get started with Actions
+
+name: CI
+
+# Controls when the workflow will run
+on:
+  # Triggers the workflow on push or pull request events but only for the "main" branch
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+  # Allows you to run this workflow manually from the Actions tab
+  workflow_dispatch:
+
+# A workflow run is made up of one or more jobs that can run sequentially or in parallel
+jobs:
+  # This workflow contains a single job called "build"
+  build:
+    # The type of runner that the job will run on
+    runs-on: ubuntu-latest
+
+    # Steps represent a sequence of tasks that will be executed as part of the job
+    steps:
+      # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
+      - uses: actions/checkout@v4
+
+      # Runs a single command using the runners shell
+      - name: Run a one-line script
+        run: echo Hello, world!
+
+      # Runs a set of commands using the runners shell
+      - name: Run a multi-line script
+        run: |
+          echo Add other actions to build,
+          echo test, and deploy your project.
+import discord
+from discord.ext import commands, tasks
+import aiosqlite
+import datetime
+import re
+import asyncio
+import pandas as pd
+import os
+import logging
+import tempfile
+import difflib
+
+# -----------------------
+# Configuration (env)
+# -----------------------
+TOKEN = os.environ.get('DISCORD_TOKEN')
+REMINDER_CHANNEL_ID = None
+try:
+    REMINDER_CHANNEL_ID = int(os.environ.get('REMINDER_CHANNEL_ID', '0'))
+except Exception:
+    REMINDER_CHANNEL_ID = 0
+API_KEY = os.environ.get('API_KEY', '')
+
+DB_NAME = os.environ.get('DB_NAME', 'learning_resources.db')
+PREFIX = os.environ.get('BOT_PREFIX', '!')
+
+# -----------------------
+# Logging
+# -----------------------
+logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s:%(name)s: %(message)s')
+logger = logging.getLogger('chinese-bot')
+
+if not TOKEN:
+    logger.error("DISCORD_TOKEN not set. Bot will not run.")
+
+# -----------------------
+# Intents & bot init
+# -----------------------
+intents = discord.Intents.default()
+intents.message_content = True
+intents.members = True
+
+bot = commands.Bot(command_prefix=PREFIX, intents=intents)
+bot.db = None
+bot.db_lock = asyncio.Lock()  # protect DB writes
+# A small in-memory cache to avoid inserting exact duplicates rapidly
+bot._recent_urls = set()
+bot._recent_urls_lock = asyncio.Lock()
+
+# -----------------------
+# URL regex (improved)
+# -----------------------
+URL_RE = re.compile(r'https?://[^\s<>"]+')
+
+# -----------------------
+# Simple FAQ bank
+# -----------------------
+QA_BANK = {
+    "chao ban": "你好! Nǐ hǎo! Chào bạn, bạn cần hỗ trợ gì về Tiếng Trung ạ?",
+    "bai tap 5": "Bài tập 5 là bài HSK 1 về 'số đếm và chào hỏi'. Bạn đã làm đến phần luyện nghe chưa?",
+    "tu moi bai 3": "Từ mới bài 3 gồm: 你好 (nǐ hǎo), 谢谢 (xièxiè), 不客气 (bù kèqì).",
+    "ngu phap co ban": "Ngữ pháp Tiếng Trung cơ bản là S-V-O. Ví dụ: 我(S) 爱(V) 你(O).",
+}
+
+# -----------------------
+# Reminders (hour, minute, weekday(0=Mon), message)
+# -----------------------
+REMINDERS = [
+    (19, 30, 2, "🔔 Đã đến giờ vào lớp Tiếng Trung HSK 1! Chuẩn bị sách vở và tai nghe nhé."),
+    (10, 0, 5, "📝 Hãy dành 30 phút để ôn lại từ vựng cũ và làm bài tập ngữ pháp tuần này.")
+]
+
+# -----------------------
+# Helpers
+# -----------------------
+def normalize_url(u: str) -> str:
+    # Basic normalizer: strip trailing punctuation and whitespace
+    u = u.strip().rstrip('.,;:!?')
+    return u
+
+async def ensure_db_initialized():
+    if bot.db is None:
+        bot.db = await aiosqlite.connect(DB_NAME)
+        await bot.db.execute("""
+            CREATE TABLE IF NOT EXISTS links (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                url TEXT NOT NULL,
+                source TEXT,
+                timestamp DATETIME
+            )
+        """)
+        await bot.db.execute("CREATE INDEX IF NOT EXISTS idx_links_url ON links(url)")
+        await bot.db.commit()
+
+# -----------------------
+# Events
+# -----------------------
+@bot.event
+async def on_ready():
+    logger.info("Bot ready: %s", bot.user)
+    await ensure_db_initialized()
+    if not check_reminders.is_running():
+        check_reminders.start()
+
+@bot.event
+async def on_command_error(ctx, error):
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.send("Bạn không có quyền để sử dụng lệnh này.")
+    elif isinstance(error, commands.BadArgument):
+        await ctx.send("Tham số không hợp lệ. Kiểm tra lại cú pháp.")
+    elif isinstance(error, commands.MissingRequiredArgument):
+        await ctx.send("Thiếu tham số bắt buộc. Kiểm tra lại cú pháp.")
+    else:
+        # Log unexpected errors
+        logger.exception("Unhandled command error: %s", error)
+        await ctx.send(f"Có lỗi xảy ra: {str(error)}")
+
+@bot.event
+async def on_message(message):
+    # Ignore self
+    if message.author == bot.user:
+        return
+
+    # Let commands run first if message starts with prefix
+    if message.content.startswith(PREFIX):
+        await bot.process_commands(message)
+        return
+
+    # Find URLs
+    try:
+        urls = URL_RE.findall(message.content)
+    except Exception:
+        urls = []
+
+    if urls:
+        normalized = [normalize_url(u) for u in urls]
+        # Deduplicate in this message
+        unique_urls = list(dict.fromkeys(normalized))
+        await ensure_db_initialized()
+        async with bot._recent_urls_lock:
+            # remove any URLs that were seen in-memory to avoid immediate duplicates
+            to_insert = [u for u in unique_urls if u not in bot._recent_urls]
+            # keep a sliding window of recent urls
+            if to_insert:
+                bot._recent_urls.update(to_insert)
+                # cap memory cache
+                if len(bot._recent_urls) > 2000:
+                    # naive reset to prevent unbounded growth
+                    bot._recent_urls.clear()
+            else:
+                to_insert = []
+
+        if to_insert:
+            try:
+                async with bot.db_lock:
+                    async with bot.db.executemany(
+                        "INSERT INTO links (url, source, timestamp) VALUES (?, ?, ?)",
+                        [(u, f"#{message.channel.name}", datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")) for u in to_insert]
+                    ):
+                        pass
+                    await bot.db.commit()
+            except Exception as e:
+                logger.exception("Error inserting urls: %s", e)
+
+    await bot.process_commands(message)
+
+# -----------------------
+# Commands
+# -----------------------
+@bot.command(name='tainguyen')
+async def get_resources(ctx, limit: int = 10):
+    """!tainguyen - Hiển thị danh sách các link được gửi gần nhất."""
+    await ensure_db_initialized()
+    if limit <= 0 or limit > 50:
+        limit = 10
+    try:
+        async with bot.db.execute("SELECT url, source, timestamp FROM links ORDER BY id DESC LIMIT ?", (limit,)) as cursor:
+            rows = await cursor.fetchall()
+    except Exception as e:
+        logger.exception("DB read failed: %s", e)
+        await ctx.send("Lỗi khi đọc DB. Kiểm tra log.")
+        return
+
+    if not rows:
+        await ctx.send("Kho tài nguyên hiện đang trống. Hãy gửi link để bot tự động lưu nhé! 💾")
+        return
+
+    embed = discord.Embed(title="📚 Liên Kết Tài Nguyên Tiếng Trung Gần Nhất", color=0x3498db)
+    for i, (url, source, ts) in enumerate(rows, start=1):
+        # add as fields to avoid overly long single description
+        display_url = url if len(url) <= 75 else url[:72] + "..."
+        embed.add_field(name=f"{i}. {source} • {ts}", value=f"<{display_url}>", inline=False)
+
+    await ctx.send(embed=embed)
+
+@bot.command(name='hochanh')
+async def study_help(ctx, *, question: str):
+    """!hochanh <câu hỏi> - Trả lời FAQ cơ bản (fuzzy match)."""
+    q_norm = question.lower().strip()
+    # exact first
+    if q_norm in QA_BANK:
+        await ctx.send(f"**💡 Hỗ trợ Học tập:** {QA_BANK[q_norm]}")
+        return
+
+    # fuzzy match
+    choices = list(QA_BANK.keys())
+    best = difflib.get_close_matches(q_norm, choices, n=1, cutoff=0.6)
+    if best:
+        await ctx.send(f"**💡 Gợi ý:** {QA_BANK[best[0]]} (trả lời cho: {best[0]})")
+    else:
+        await ctx.send(f"Xin lỗi, tớ chưa có dữ liệu chính xác cho câu hỏi **'{question}'**. Bạn có thể dùng lệnh `!hoi` để hỏi Trợ lý AI.")
+
+@bot.command(name='hoi')
+async def chat_with_ai(ctx, *, prompt: str):
+    """!hoi <câu hỏi> - Khung cho API AI (chưa tích hợp thực tế)."""
+    async with ctx.typing():
+        if not API_KEY:
+            await ctx.send(
+                "**[CHỨC NĂNG AI CHAT CHƯA KÍCH HOẠT]**\n"
+                "Đặt API_KEY trong biến môi trường để kích hoạt. Hiện chỉ có khung tích hợp."
+            )
+            return
+
+        # Example placeholder: integrate provider here (OpenAI, etc.)
+        # Example (pseudocode):
+        # response = await call_openai(prompt, api_key=API_KEY)
+        # await ctx.send(f"**💬 Trợ lý AI:** {response}")
+        await ctx.send(f"**💬 Trợ lý AI (chưa cấu hình):** Đã nhận câu hỏi: '{prompt}'. (API_KEY tồn tại nhưng chưa có logic gọi AI.)")
+
+@bot.command(name='exportdata')
+@commands.has_permissions(administrator=True)
+async def export_data(ctx, limit: int = 5000):
+    """!exportdata <limit> - Xuất lịch sử tin nhắn để huấn luyện AI (chỉ Admin)."""
+    if limit <= 0:
+        await ctx.send("Limit phải lớn hơn 0.")
+        return
+
+    await ctx.send(f"⏳ Bắt đầu thu thập {limit} tin nhắn gần nhất từ kênh **{ctx.channel.name}**...")
+    messages_data = []
+    count = 0
+    try:
+        async for message in ctx.channel.history(limit=limit, oldest_first=False):
+            if message.author.bot or (message.content and message.content.startswith(PREFIX)):
+                continue
+            if message.content:
+                messages_data.append({
+                    'timestamp': message.created_at.strftime("%Y-%m-%d %H:%M:%S"),
+                    'author': message.author.display_name,
+                    'content': message.content.replace('\n', ' ')
+                })
+                count += 1
+        if not messages_data:
+            await ctx.send("Không tìm thấy tin nhắn hợp lệ nào để xuất.")
+            return
+
+        df = pd.DataFrame(messages_data)
+        # Use a temporary file
+        with tempfile.NamedTemporaryFile(prefix=f"chat_{ctx.guild.id}_{ctx.channel.id}_", suffix=".csv", delete=False) as tmp:
+            temp_name = tmp.name
+        df.to_csv(temp_name, index=False, encoding='utf-8-sig')
+        await ctx.send(f"✅ Đã thu thập và lưu thành công **{count}** tin nhắn vào file.", file=discord.File(temp_name))
+    except Exception as e:
+        logger.exception("exportdata failed: %s", e)
+        await ctx.send(f"Lỗi xảy ra trong quá trình export: {e}")
+    finally:
+        try:
+            if 'temp_name' in locals() and os.path.exists(temp_name):
+                os.remove(temp_name)
+        except Exception:
+            pass
+
+# -----------------------
+# Reminder loop
+# -----------------------
+@tasks.loop(minutes=1)
+async def check_reminders():
+    try:
+        now = datetime.datetime.utcnow()
+        current_hour = now.hour
+        current_minute = now.minute
+        current_weekday = now.weekday()  # Monday = 0
+
+        channel = bot.get_channel(REMINDER_CHANNEL_ID) if REMINDER_CHANNEL_ID else None
+        if channel is None and REMINDER_CHANNEL_ID:
+            # try fetch
+            try:
+                channel = await bot.fetch_channel(REMINDER_CHANNEL_ID)
+            except Exception:
+                channel = None
+
+        if not channel:
+            # channel not configured or not available
+            return
+
+        for hour, minute, weekday, content in REMINDERS:
+            if current_hour == hour and current_minute == minute and current_weekday == weekday:
+                await channel.send(f"**TIN NHẮN NHẮC NHỞ LỊCH HỌC:** {content} @here")
+    except Exception as e:
+        logger.exception("Error in check_reminders: %s", e)
+
+# -----------------------
+# Shutdown cleanup
+# -----------------------
+async def close_db():
+    try:
+        if bot.db:
+            await bot.db.close()
+            bot.db = None
+    except Exception:
+        logger.exception("Failed to close DB")
+
+@bot.event
+async def on_disconnect():
+    await close_db()
+
+# -----------------------
+# Run
+# -----------------------
+if __name__ == '__main__':
+    if not TOKEN:
+        logger.error("Bot will not start: missing token.")
+    else:
+        try:
+            bot.run(TOKEN)
+        except discord.errors.LoginFailure:
+            logger.exception("Login failure - check token")
+        except Exception:
+            logger.exception("Unhandled error while running the bot")
